@@ -1,9 +1,58 @@
 // src/components/RoomCreator.jsx
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Pause, RotateCcw, Users, Clock, Trophy, Settings, ShieldAlert, CheckCircle2 } from 'lucide-react';
+import { Play, Pause, RotateCcw, Users, Clock, Trophy, Settings, ShieldAlert } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { db } from '../firebase'; // นำเข้า db จาก firebase.js
-import { doc, setDoc, onSnapshot, collection, updateDoc, deleteDoc } from 'firebase/firestore';
+import {
+  collection,
+  deleteDoc,
+  doc,
+  onSnapshot,
+  runTransaction,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+} from 'firebase/firestore';
+
+const FDA_JUNIOR_LOGO_URL = 'https://i.postimg.cc/VL8jfMz0/FKVHoyve-Sk-Sp-SWu-Aq-D5xth-KQ.png';
+const WAITING_MUSIC_URL = 'https://cdn.pixabay.com/download/audio/2022/03/15/audio_2b4c9970d4.mp3?filename=mysterious-celesta-114064.mp3';
+const ACTION_MUSIC_URL = 'https://cdn.pixabay.com/download/audio/2022/10/18/audio_31c2730e64.mp3?filename=action-dramatic-sport-rock-trailer-122763.mp3';
+const CELEBRATION_MUSIC_URL = 'https://cdn.pixabay.com/download/audio/2021/08/09/audio_c8c8a73467.mp3?filename=success-fanfare-trumpets-6185.mp3';
+
+const toMillis = (value) => {
+  if (!value) return 0;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  if (typeof value.toMillis === 'function') return value.toMillis();
+  if (typeof value.seconds === 'number') {
+    return value.seconds * 1000 + Math.floor((value.nanoseconds || 0) / 1000000);
+  }
+
+  return 0;
+};
+
+const getRoomTimeLimitSeconds = (room, fallbackMinutes = 3) => {
+  const seconds = Number(room?.timeLimitSeconds || room?.durationSeconds);
+  if (seconds > 0) return seconds;
+
+  const minutes = Number(room?.timeLimit || room?.durationMinutes || fallbackMinutes);
+  return minutes > 0 ? minutes * 60 : 0;
+};
+
+const getRoomElapsedSeconds = (room, nowMs = Date.now()) => {
+  const startMs = toMillis(room?.startedAt || room?.startTime || room?.gameStartedAt);
+  if (!startMs) return 0;
+
+  const totalPausedMs = Number(room?.totalPausedMs || room?.pausedDurationMs || 0);
+  const pausedAtMs = room?.status === 'paused' ? toMillis(room?.pausedAt) : 0;
+  const currentPauseMs = pausedAtMs ? Math.max(0, nowMs - pausedAtMs) : 0;
+  const elapsedMs = Math.max(0, nowMs - startMs - totalPausedMs - currentPauseMs);
+
+  return Math.floor(elapsedMs / 1000);
+};
 
 export default function RoomCreator() {
   const [roomState, setRoomState] = useState('setup'); 
@@ -11,100 +60,237 @@ export default function RoomCreator() {
   const [roomCode, setRoomCode] = useState('');
   const [timeLeft, setTimeLeft] = useState(0);
   const [players, setPlayers] = useState([]);
+  const [roomData, setRoomData] = useState(null);
 
-  const adventureMusic = useRef(new Audio('[https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3?filename=epic-adventure-112101.mp3](https://cdn.pixabay.com/download/audio/2022/05/27/audio_1808fbf07a.mp3?filename=epic-adventure-112101.mp3)'));
-  const celebrationMusic = useRef(new Audio('[https://cdn.pixabay.com/download/audio/2021/08/09/audio_c8c8a73467.mp3?filename=success-fanfare-trumpets-6185.mp3](https://cdn.pixabay.com/download/audio/2021/08/09/audio_c8c8a73467.mp3?filename=success-fanfare-trumpets-6185.mp3)'));
+  const waitingMusic = useRef(new Audio(WAITING_MUSIC_URL));
+  const adventureMusic = useRef(new Audio(ACTION_MUSIC_URL));
+  const celebrationMusic = useRef(new Audio(CELEBRATION_MUSIC_URL));
+  const teacherVoiceTimer = useRef(null);
+  const finishRequested = useRef(false);
 
   // --- Real-time Firebase Listener ---
   useEffect(() => {
     if (!roomCode) return;
-    
+
+    const roomRef = doc(db, "rooms", roomCode);
+    const unsubscribeRoom = onSnapshot(roomRef, (roomSnap) => {
+      if (!roomSnap.exists()) return;
+
+      const data = roomSnap.data();
+      setRoomData(data);
+      setRoomState(data.status || 'waiting');
+    });
+
     // ฟังการเปลี่ยนแปลงของนักเรียนในห้องนี้
     const playersRef = collection(db, "rooms", roomCode, "players");
-    const unsubscribe = onSnapshot(playersRef, (snapshot) => {
+    const unsubscribePlayers = onSnapshot(playersRef, (snapshot) => {
       const playersData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       // เรียงลำดับคะแนนจากมากไปน้อย
       setPlayers(playersData.sort((a, b) => b.score - a.score));
     });
 
-    return () => unsubscribe();
+    return () => {
+      unsubscribeRoom();
+      unsubscribePlayers();
+    };
   }, [roomCode]);
 
   // --- Audio Control ---
   useEffect(() => {
+    waitingMusic.current.loop = true;
+    waitingMusic.current.volume = 0.25;
     adventureMusic.current.loop = true;
+    adventureMusic.current.volume = 0.38;
     celebrationMusic.current.loop = true;
+    celebrationMusic.current.volume = 0.45;
 
-    if (roomState === 'waiting' || roomState === 'playing') {
+    if (roomState === 'waiting') {
+      adventureMusic.current.pause();
+      adventureMusic.current.currentTime = 0;
+      celebrationMusic.current.pause();
+      celebrationMusic.current.currentTime = 0;
+      waitingMusic.current.play().catch(() => console.log("Audio block"));
+    } else if (roomState === 'playing') {
+      waitingMusic.current.pause();
+      waitingMusic.current.currentTime = 0;
       celebrationMusic.current.pause();
       celebrationMusic.current.currentTime = 0;
       adventureMusic.current.play().catch(e => console.log("Audio block"));
-    } else if (roomState === 'finished') {
+    } else if (roomState === 'paused') {
+      waitingMusic.current.pause();
       adventureMusic.current.pause();
+      celebrationMusic.current.pause();
+    } else if (roomState === 'finished') {
+      waitingMusic.current.pause();
+      adventureMusic.current.pause();
+      adventureMusic.current.currentTime = 0;
       celebrationMusic.current.play().catch(e => console.log("Audio block"));
       triggerConfetti();
     } else {
+      waitingMusic.current.pause();
       adventureMusic.current.pause();
       celebrationMusic.current.pause();
     }
   }, [roomState]);
 
+  // --- Teacher Waiting Voice ---
+  useEffect(() => {
+    if (roomState !== 'waiting') {
+      window.clearInterval(teacherVoiceTimer.current);
+      window.speechSynthesis?.cancel();
+      return;
+    }
+
+    const speakWaitingMessage = () => {
+      if (!('speechSynthesis' in window)) return;
+
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(
+        'ห้องเกมพร้อมแล้ว นักเรียนเตรียมตัวให้พร้อม รอครูกดเริ่มเกม',
+      );
+      utterance.lang = 'th-TH';
+      utterance.rate = 0.95;
+      utterance.pitch = 1;
+      utterance.volume = 0.85;
+      window.speechSynthesis.speak(utterance);
+    };
+
+    speakWaitingMessage();
+    teacherVoiceTimer.current = window.setInterval(speakWaitingMessage, 15000);
+
+    return () => {
+      window.clearInterval(teacherVoiceTimer.current);
+      window.speechSynthesis?.cancel();
+    };
+  }, [roomState]);
+
   // --- Timer & State Sync ---
   useEffect(() => {
     let timer;
-    if (roomState === 'playing' && timeLeft > 0) {
-      timer = setInterval(() => setTimeLeft(prev => prev - 1), 1000);
-    } else if (timeLeft === 0 && roomState === 'playing') {
-      handleFinishGame();
+
+    const syncTimeFromRoom = () => {
+      const fallbackMinutes = Number(settings.timeLimit || 3);
+      const limitSeconds = getRoomTimeLimitSeconds(roomData, fallbackMinutes);
+      const elapsedSeconds = getRoomElapsedSeconds(roomData);
+      const remainingSeconds = Math.max(0, limitSeconds - elapsedSeconds);
+
+      setTimeLeft(remainingSeconds);
+
+      if (
+        roomState === 'playing' &&
+        limitSeconds > 0 &&
+        elapsedSeconds >= limitSeconds &&
+        !finishRequested.current
+      ) {
+        finishRequested.current = true;
+        handleFinishGame();
+      }
+    };
+
+    if ((roomState === 'playing' || roomState === 'paused') && roomData) {
+      syncTimeFromRoom();
+      timer = setInterval(syncTimeFromRoom, 1000);
     }
+
     return () => clearInterval(timer);
-  }, [roomState, timeLeft]);
+  }, [roomState, roomData, settings.timeLimit]);
 
   // --- Firebase Actions ---
   const handleCreateRoom = async () => {
     const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const timeLimitSeconds = Number(settings.timeLimit || 3) * 60;
+
+    finishRequested.current = false;
     setRoomCode(code);
-    setTimeLeft(settings.timeLimit * 60);
+    setTimeLeft(timeLimitSeconds);
+    setRoomData(null);
     setRoomState('waiting');
 
     // สร้างห้องใน Firestore
     await setDoc(doc(db, "rooms", code), {
       status: 'waiting',
-      timeLimit: settings.timeLimit,
-      itemLimit: settings.itemLimit,
-      createdAt: new Date()
+      timeLimit: Number(settings.timeLimit || 3),
+      timeLimitSeconds,
+      itemLimit: Number(settings.itemLimit || 5),
+      startedAt: null,
+      pausedAt: null,
+      totalPausedMs: 0,
+      finishedAt: null,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
     });
   };
 
   const handleStartGame = async () => {
     if (players.length === 0 && !window.confirm("ยังไม่มีผู้เล่นในห้อง ต้องการเริ่มเกมหรือไม่?")) return;
+    const timeLimitSeconds = Number(settings.timeLimit || roomData?.timeLimit || 3) * 60;
+
+    finishRequested.current = false;
+    setTimeLeft(timeLimitSeconds);
     setRoomState('playing');
+
     // อัปเดตสถานะห้องเป็น playing เพื่อให้นักเรียนเริ่มเกมได้
-    await updateDoc(doc(db, "rooms", roomCode), { status: 'playing' });
+    await updateDoc(doc(db, "rooms", roomCode), {
+      status: 'playing',
+      startedAt: serverTimestamp(),
+      pausedAt: null,
+      totalPausedMs: 0,
+      timeLimit: Number(settings.timeLimit || roomData?.timeLimit || 3),
+      timeLimitSeconds,
+      updatedAt: serverTimestamp(),
+    });
   };
 
   const handlePauseGame = async () => {
     setRoomState('paused');
     adventureMusic.current.pause();
-    await updateDoc(doc(db, "rooms", roomCode), { status: 'paused' });
+    await updateDoc(doc(db, "rooms", roomCode), {
+      status: 'paused',
+      pausedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
   };
 
   const handleResumeGame = async () => {
+    const roomRef = doc(db, "rooms", roomCode);
+
+    await runTransaction(db, async (transaction) => {
+      const roomSnap = await transaction.get(roomRef);
+      const room = roomSnap.data() || {};
+      const pausedAtMs = toMillis(room.pausedAt);
+      const extraPausedMs = pausedAtMs ? Math.max(0, Date.now() - pausedAtMs) : 0;
+
+      transaction.update(roomRef, {
+        status: 'playing',
+        pausedAt: null,
+        totalPausedMs: Number(room.totalPausedMs || 0) + extraPausedMs,
+        updatedAt: serverTimestamp(),
+      });
+    });
+
     setRoomState('playing');
-    adventureMusic.current.play();
-    await updateDoc(doc(db, "rooms", roomCode), { status: 'playing' });
+    adventureMusic.current.play().catch(() => {});
   };
 
   const handleFinishGame = async () => {
+    if (!roomCode) return;
+
     setRoomState('finished');
-    await updateDoc(doc(db, "rooms", roomCode), { status: 'finished' });
+    await updateDoc(doc(db, "rooms", roomCode), {
+      status: 'finished',
+      finishedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
   };
 
   const handleReset = async () => {
     // ลบห้องทิ้งเมื่อกดเริ่มใหม่
     if(roomCode) await deleteDoc(doc(db, "rooms", roomCode));
+    finishRequested.current = false;
     setRoomState('setup');
     setRoomCode('');
+    setRoomData(null);
+    setTimeLeft(0);
     setPlayers([]);
   };
 
@@ -130,10 +316,22 @@ export default function RoomCreator() {
     <div className="min-h-screen bg-[#0a192f] text-slate-200 font-sans relative overflow-hidden flex flex-col">
       <div className="absolute top-[-20%] left-[-10%] w-[40rem] h-[40rem] bg-blue-600 rounded-full mix-blend-multiply filter blur-[128px] opacity-20 pointer-events-none"></div>
 
-      <header className="bg-[#112240]/80 backdrop-blur-md border-b border-blue-500/30 p-6 flex justify-between items-center z-10 shadow-lg">
-        <div className="flex items-center gap-3">
-          <ShieldAlert className="text-cyan-400 w-8 h-8" />
-          <h1 className="text-2xl font-black text-white tracking-widest uppercase">SFS Command Center</h1>
+      <header className="bg-[#112240]/80 backdrop-blur-md border-b border-blue-500/30 p-6 flex flex-col md:flex-row justify-between items-center gap-5 z-10 shadow-lg">
+        <div className="flex items-center gap-4">
+          <div className="bg-white rounded-2xl p-2 shadow-[0_0_22px_rgba(6,182,212,0.25)] border border-cyan-300/60">
+            <img
+              src={FDA_JUNIOR_LOGO_URL}
+              alt="โลโก้ อย.น้อย"
+              className="w-16 h-16 object-contain"
+            />
+          </div>
+          <div className="flex items-center gap-3">
+            <ShieldAlert className="text-cyan-400 w-8 h-8" />
+            <div>
+              <h1 className="text-2xl font-black text-white tracking-widest uppercase">SFS Command Center</h1>
+              <p className="text-cyan-300 text-xs md:text-sm font-bold tracking-widest uppercase">อย.น้อย Nutrition Mission</p>
+            </div>
+          </div>
         </div>
         {roomState !== 'setup' && (
           <div className="bg-blue-950/50 border border-blue-500/50 px-6 py-2 rounded-full flex items-center gap-4 shadow-[0_0_15px_rgba(37,99,235,0.3)]">

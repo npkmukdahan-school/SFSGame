@@ -208,6 +208,44 @@ const getGoogleDrivePreviewUrl = (url) => {
   return `https://drive.google.com/file/d/${fileId}/preview`;
 };
 
+const toMillis = (value) => {
+  if (!value) return 0;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  if (typeof value.toMillis === 'function') return value.toMillis();
+  if (typeof value.seconds === 'number') {
+    return value.seconds * 1000 + Math.floor((value.nanoseconds || 0) / 1000000);
+  }
+
+  return 0;
+};
+
+const getRoomStartMs = (room) =>
+  toMillis(room?.startedAt || room?.startTime || room?.gameStartedAt || room?.playingAt);
+
+const getRoomTimeLimitSeconds = (room) => {
+  const seconds = Number(room?.timeLimitSeconds || room?.durationSeconds);
+  if (seconds > 0) return seconds;
+
+  const minutes = Number(room?.timeLimit || room?.durationMinutes || 0);
+  return minutes > 0 ? minutes * 60 : 0;
+};
+
+const getRoomElapsedSeconds = (room, nowMs = Date.now()) => {
+  const startMs = getRoomStartMs(room);
+  if (!startMs) return 0;
+
+  const totalPausedMs = Number(room?.totalPausedMs || room?.pausedDurationMs || 0);
+  const pausedAtMs = room?.status === 'paused' ? toMillis(room?.pausedAt) : 0;
+  const currentPauseMs = pausedAtMs ? Math.max(0, nowMs - pausedAtMs) : 0;
+  const elapsedMs = Math.max(0, nowMs - startMs - totalPausedMs - currentPauseMs);
+
+  return Math.floor(elapsedMs / 1000);
+};
+
 function FoodVideoPlayer({ videoUrl }) {
   const cleanVideoUrl = String(videoUrl || '').trim();
   const youtubeEmbedUrl = getYouTubeEmbedUrl(cleanVideoUrl);
@@ -255,6 +293,7 @@ export default function GameMain() {
 
   const [isPaused, setIsPaused] = useState(false);
   const [timeUsed, setTimeUsed] = useState(0);
+  const [timeRemaining, setTimeRemaining] = useState(0);
 
   const [scoreSum, setScoreSum] = useState(0);
   const [score, setScore] = useState(0);
@@ -269,12 +308,16 @@ export default function GameMain() {
   const championMusic = useRef(
     new Audio('https://cdn.pixabay.com/download/audio/2021/08/09/audio_c8c8a73467.mp3?filename=success-fanfare-trumpets-6185.mp3'),
   );
+  const actionMusic = useRef(
+    new Audio('https://cdn.pixabay.com/download/audio/2022/10/18/audio_31c2730e64.mp3?filename=action-dramatic-sport-rock-trailer-122763.mp3'),
+  );
 
   const videoRef = useRef(null);
   const codeReader = useRef(null);
   const streamRef = useRef(null);
   const trackRef = useRef(null);
   const audioContextRef = useRef(null);
+  const waitingVoiceTimerRef = useRef(null);
 
   const isProcessingScan = useRef(false);
   const lastScanRef = useRef({ code: '', time: 0 });
@@ -357,11 +400,60 @@ export default function GameMain() {
 
   useEffect(() => {
     let timer;
-    if (step === 'playing' && !isPaused) {
-      timer = setInterval(() => setTimeUsed((prev) => prev + 1), 1000);
+
+    const syncTimeFromRoom = () => {
+      const limitSeconds = getRoomTimeLimitSeconds(roomData);
+      const elapsedSeconds = getRoomElapsedSeconds(roomData);
+      const cappedElapsed = limitSeconds
+        ? Math.min(elapsedSeconds, limitSeconds)
+        : elapsedSeconds;
+
+      setTimeUsed(cappedElapsed);
+      setTimeRemaining(limitSeconds ? Math.max(0, limitSeconds - cappedElapsed) : 0);
+
+      if (step === 'playing' && limitSeconds > 0 && elapsedSeconds >= limitSeconds) {
+        setShowVideoModal(null);
+        setStep('summary');
+      }
+    };
+
+    if ((step === 'playing' || isPaused) && roomData) {
+      syncTimeFromRoom();
+      timer = setInterval(syncTimeFromRoom, 1000);
     }
+
     return () => clearInterval(timer);
-  }, [step, isPaused]);
+  }, [step, isPaused, roomData]);
+
+  useEffect(() => {
+    if (step !== 'waiting') {
+      window.clearInterval(waitingVoiceTimerRef.current);
+      window.speechSynthesis?.cancel();
+      return;
+    }
+
+    const speakWaitingMessage = () => {
+      if (!('speechSynthesis' in window)) return;
+
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(
+        'เตรียมตัวให้พร้อม รอครูกดเริ่มเกม',
+      );
+      utterance.lang = 'th-TH';
+      utterance.rate = 0.95;
+      utterance.pitch = 1.05;
+      utterance.volume = 0.8;
+      window.speechSynthesis.speak(utterance);
+    };
+
+    speakWaitingMessage();
+    waitingVoiceTimerRef.current = window.setInterval(speakWaitingMessage, 12000);
+
+    return () => {
+      window.clearInterval(waitingVoiceTimerRef.current);
+      window.speechSynthesis?.cancel();
+    };
+  }, [step]);
 
   useEffect(() => {
     let hintTimer;
@@ -383,6 +475,21 @@ export default function GameMain() {
 
     return () => clearInterval(hintTimer);
   }, [step, isPaused, showVideoModal, cameraError]);
+
+  useEffect(() => {
+    actionMusic.current.loop = true;
+    actionMusic.current.volume = 0.35;
+
+    if (step === 'playing' && !isPaused && !showVideoModal) {
+      actionMusic.current.play().catch(() => {});
+    } else {
+      actionMusic.current.pause();
+    }
+
+    return () => {
+      actionMusic.current.pause();
+    };
+  }, [step, isPaused, showVideoModal]);
 
   useEffect(() => {
     if (step === 'summary') {
@@ -1028,8 +1135,11 @@ export default function GameMain() {
                 <div className="text-xs font-bold text-slate-400">
                   เป้าหมาย: {scannedItems}/{roomData?.itemLimit}
                 </div>
-                <div className="text-xl font-black text-amber-400 flex gap-1">
-                  <Clock size={18} /> {formatTime(timeUsed)}
+                <div className="text-[10px] font-black text-cyan-300 uppercase tracking-widest">
+                  เหลือเวลา
+                </div>
+                <div className="text-xl font-black text-amber-400 flex gap-1 justify-end">
+                  <Clock size={18} /> {formatTime(timeRemaining || 0)}
                 </div>
               </div>
             </div>
