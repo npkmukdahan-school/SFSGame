@@ -15,7 +15,7 @@ import {
 } from 'firebase/firestore';
 
 const FDA_JUNIOR_LOGO_URL = 'https://i.postimg.cc/VL8jfMz0/FKVHoyve-Sk-Sp-SWu-Aq-D5xth-KQ.png';
-const WAITING_MUSIC_URL = 'https://cdn.pixabay.com/download/audio/2022/03/15/audio_2b4c9970d4.mp3?filename=mysterious-celesta-114064.mp3';
+const WAITING_MUSIC_URL = 'https://pixabay.com/music//?utm_source=link-attribution&utm_medium=referral&utm_campaign=music&utm_content=474517';
 const ACTION_MUSIC_URL = 'https://cdn.pixabay.com/download/audio/2022/10/18/audio_31c2730e64.mp3?filename=action-dramatic-sport-rock-trailer-122763.mp3';
 const CELEBRATION_MUSIC_URL = 'https://cdn.pixabay.com/download/audio/2021/08/09/audio_c8c8a73467.mp3?filename=success-fanfare-trumpets-6185.mp3';
 
